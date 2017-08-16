@@ -1,15 +1,16 @@
 ﻿using System;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 using Android.Media;
+using FlacBox;
 
 namespace record.Droid
 {
-	public class AndroidAudioRecorder
+	public class AndroidAudioRecorder : IAudioRecorder
 	{
 		private AudioRecord _recorder;
 
-		private static int RECORDER_SAMPLERATE = 16000;
 		private static ChannelIn RECORDER_CHANNELS = ChannelIn.Mono;
 		private static Encoding RECORDER_AUDIO_ENCODING = Encoding.Pcm16bit;
 
@@ -17,40 +18,58 @@ namespace record.Droid
 		private bool _isRecording;
 
 		private MemoryStream _ms;
+		private CancellationTokenSource _timeoutToken;
+		private TaskCompletionSource<AudioRecordResult> _tcs;
+		private AudioRecordOptions _options;
 
-		public void StartRecording()
+		public Task<AudioRecordResult> Record(AudioRecordOptions options = null)
 		{
-			_bufferSize = AudioRecord.GetMinBufferSize(RECORDER_SAMPLERATE, RECORDER_CHANNELS, RECORDER_AUDIO_ENCODING) * 3;
+			_options = options ?? AudioRecordOptions.Empty;
+			_tcs = new TaskCompletionSource<AudioRecordResult>();
 
-			_recorder = new AudioRecord(AudioSource.VoiceRecognition, RECORDER_SAMPLERATE, RECORDER_CHANNELS, RECORDER_AUDIO_ENCODING, _bufferSize);
+			_bufferSize = AudioRecord.GetMinBufferSize(_options.SampleRate, RECORDER_CHANNELS, RECORDER_AUDIO_ENCODING) * 3;
+
+			_recorder = new AudioRecord(AudioSource.VoiceRecognition, _options.SampleRate, RECORDER_CHANNELS, RECORDER_AUDIO_ENCODING, _bufferSize);
 
 			if (_recorder.State == State.Initialized)
+			{
 				_recorder.StartRecording();
+			}
+			else
+			{
+				return Task.FromResult(new AudioRecordResult($"AudioRecord initialisation returned unexpected state ({_recorder.State})"));
+			}
 
 			_isRecording = true;
+			_timeoutToken = new CancellationTokenSource();
+
 			Task.Run(() => RecordAudio());
+			Task.Run(() => Timeout());
+
+			return _tcs.Task;
 		}
 
-		public byte[] StopRecording()
+		public void Stop()
 		{
 			if (_isRecording && _recorder == null)
 			{
-				// uh oh
+				_tcs.TrySetResult(new AudioRecordResult($"Not recording"));
 			}
 
+			_timeoutToken?.Cancel();
 			_isRecording = false;
 
 			if (_recorder.State == State.Initialized)
+			{
 				_recorder.Stop();
+			}
+
 			_recorder.Release();
 
-			// grab wav from memory stream
+			// Android audio is raw stream content, so add WAV header
 			var wavstream = new MemoryStream();
 
-			WriteWaveFileHeader(wavstream,
-								_ms.Length,
-								RECORDER_SAMPLERATE,
-								1);
+			WriteWaveFileHeader(wavstream, _ms.Length, _options.SampleRate, 1);
 
 			_ms.Seek(0, SeekOrigin.Begin);
 			_ms.CopyTo(wavstream);
@@ -58,7 +77,26 @@ namespace record.Droid
 			_ms.Dispose();
 			_ms = null;
 
-			return wavstream.ToArray();
+			if (_options.StreamFormat == AudioRecordOptions.Format.Wave)
+			{
+				_tcs.TrySetResult(new AudioRecordResult(wavstream.ToArray()));
+			}
+			else if (_options.StreamFormat == AudioRecordOptions.Format.Flac)
+			{
+				// encode audio into flac
+				using (var ms = new MemoryStream())
+				{
+					using (var what = new WaveOverFlacStream(ms, WaveOverFlacStreamMode.Encode, true))
+					{
+						wavstream.Seek(0, SeekOrigin.Begin);
+						wavstream.CopyTo(what);
+					}
+
+					ms.Flush();
+					ms.Seek(0, SeekOrigin.Begin);
+					_tcs.TrySetResult(new AudioRecordResult(ms.ToArray()));
+				}
+			}
 		}
 
 		private void RecordAudio()
@@ -81,8 +119,7 @@ namespace record.Droid
 			_ms.Flush();
 		}
 
-		private void WriteWaveFileHeader(
-		 MemoryStream ms, long totalAudioLen, long longSampleRate, int channels)
+		private void WriteWaveFileHeader(MemoryStream ms, long totalAudioLen, long longSampleRate, int channels)
 		{
 			long byteRate = 16 * longSampleRate * 1 / 8;
 			long totalDataLen = totalAudioLen + 36;
@@ -135,6 +172,22 @@ namespace record.Droid
 			header[43] = (byte)((totalAudioLen >> 24) & 0xff);
 
 			ms.Write(header, 0, 44);
+		}
+
+		private async Task Timeout()
+		{
+			try
+			{
+				await Task.Delay(10000, _timeoutToken.Token);
+
+				System.Diagnostics.Debug.WriteLine("TIMEOUT REACHED");
+				_isRecording = false;
+				_tcs.TrySetResult(new AudioRecordResult("Timeout reached"));
+			}
+			catch (TaskCanceledException)
+			{
+				// user stopped recording before timeout reached
+			}
 		}
 	}
 }

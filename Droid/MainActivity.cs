@@ -3,6 +3,7 @@ using Android.Widget;
 using Android.OS;
 using Android.Media;
 using Java.IO;
+using System.Threading.Tasks;
 
 namespace record.Droid
 {
@@ -14,6 +15,11 @@ namespace record.Droid
 
 		TextView _output;
 		File _tmpFile;
+
+		private AudioRecordOptions _options = new AudioRecordOptions()
+		{
+			StreamFormat = AudioRecordOptions.Format.Flac
+		};
 
 		protected override void OnCreate(Bundle savedInstanceState)
 		{
@@ -33,7 +39,7 @@ namespace record.Droid
 			play.Click += Play_Click;
 		}
 
-		void Start_Click(object sender, System.EventArgs e)
+		async void Start_Click(object sender, System.EventArgs e)
 		{
 			if (_recorder != null)
 			{
@@ -41,9 +47,35 @@ namespace record.Droid
 			}
 
 			_recorder = new AndroidAudioRecorder();
-			_recorder.StartRecording();
+			var result = await _recorder.Record(_options);
 
-			_output.Text = $"started";
+			_output.Text = $"Recorded {result.AudioBytes.Length} bytes";
+
+			// playback file
+			_tmpFile = File.CreateTempFile("TCL", "wav", CacheDir);
+			_tmpFile.DeleteOnExit();
+
+			if (_options.StreamFormat == AudioRecordOptions.Format.Wave)
+			{
+				var fos = new FileOutputStream(_tmpFile);
+				fos.Write(result.AudioBytes);
+				fos.Close();
+			}
+			else
+			{
+				using (var ms = new System.IO.MemoryStream(result.AudioBytes))
+				{
+					using (var fos = System.IO.File.OpenWrite(_tmpFile.AbsolutePath))
+					{
+						using (var f = new FlacBox.WaveOverFlacStream(ms, FlacBox.WaveOverFlacStreamMode.Decode, false))
+						{
+							f.CopyTo(fos);
+						}
+					}
+				}
+			}
+
+			_recorder = null;
 		}
 
 		void Stop_Click(object sender, System.EventArgs e)
@@ -53,19 +85,7 @@ namespace record.Droid
 				return;
 			}
 
-			var bytes = _recorder.StopRecording();
-
-			_output.Text = $"Recorded {bytes.Length} bytes";
-
-			// playback
-			_tmpFile = File.CreateTempFile("TCL", "wav", CacheDir);
-			_tmpFile.DeleteOnExit();
-
-			var fos = new FileOutputStream(_tmpFile);
-			fos.Write(bytes);
-			fos.Close();
-
-			_recorder = null;
+			_recorder.Stop();
 		}
 
 		void Play_Click(object sender, System.EventArgs e)

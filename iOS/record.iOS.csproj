@@ -89,6 +89,9 @@
     <Reference Include="System.Xml" />
     <Reference Include="System.Core" />
     <Reference Include="Xamarin.iOS" />
+    <Reference Include="FlacBox.Portable">
+      <HintPath>..\packages\FlacBox.Portable.1.0.1\lib\portable-net4+sl5+wp8+win8\FlacBox.Portable.dll</HintPath>
+    </Reference>
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\record\record.csproj">
@@ -110,6 +113,7 @@
   <ItemGroup>
     <None Include="Info.plist" />
     <None Include="Entitlements.plist" />
+    <None Include="packages.config" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="Main.cs" />

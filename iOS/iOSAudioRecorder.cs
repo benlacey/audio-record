@@ -1,77 +1,123 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using AVFoundation;
+using FlacBox;
 using Foundation;
 
 namespace record.iOS
 {
-	public class iOSAudioRecorder
+	public class iOSAudioRecorder : IAudioRecorder
 	{
-		AVAudioRecorder recorder; 
-		NSError error; 
-		NSUrl url; 
-		NSDictionary settings;
-		string _audioFilePath;
+		private AVAudioRecorder _recorder;
+		private string _audioFilePath;
+		private CancellationTokenSource _cts;
+		private TaskCompletionSource<AudioRecordResult> _tcs;
+		private AudioRecordOptions _options;
 
-		public void StartRecording()
+		public Task<AudioRecordResult> Record(AudioRecordOptions options = null)
 		{
-			var audioSession = AVAudioSession.SharedInstance(); 
-			var err = audioSession.SetCategory(AVAudioSessionCategory.PlayAndRecord); 
+			_options = options ?? AudioRecordOptions.Empty;
 
-			if (err != null) { Console.WriteLine("audioSession: {0}", err); return; }
+			_tcs = new TaskCompletionSource<AudioRecordResult>();
 
-			err = audioSession.SetActive(true); 
+			var audioSession = AVAudioSession.SharedInstance();
 
-			if (err != null) { Console.WriteLine("audioSession: {0}", err); return; }
+			var err = audioSession.SetCategory(AVAudioSessionCategory.PlayAndRecord);
+			if (err != null)
+			{
+				return Task.FromResult(new AudioRecordResult($"AVAudioSession.SetCategory returned error '{err}'"));
+			}
 
-			//Declare string for application temp path and tack on the file extension
-			string fileName = string.Format ("Myfile{0}.wav", DateTime.Now.ToString ("yyyyMMddHHmmss")); 
-			_audioFilePath = Path.Combine (Path.GetTempPath(), fileName);
+			err = audioSession.SetActive(true);
+			if (err != null)
+			{
+				return Task.FromResult(new AudioRecordResult($"AVAudioSession.SetActive returned error '{err}'"));
+			}
+
+			_audioFilePath = Path.Combine(Path.GetTempPath(), $"audiorec_{DateTime.Now.Ticks}.wav");
 
 			Console.WriteLine("Audio File Path: " + _audioFilePath);
 
-			url = NSUrl.FromFilename(_audioFilePath); 
+			var url = NSUrl.FromFilename(_audioFilePath);
 
-			//set up the NSObject Array of values that will be combined with the keys to make the NSDictionary 
-			NSObject[] values = new NSObject[] { 
-				NSNumber.FromFloat (16000.0f), //Sample Rate 
-				NSNumber.FromInt32 ((int)AudioToolbox.AudioFormatType.LinearPCM), //AVFormat 
-				NSNumber.FromInt32 (1), //Channels
-				NSNumber.FromInt32 (16), //PCMBitDepth 
-				NSNumber.FromBoolean (false), //IsBigEndianKey 
-				NSNumber.FromBoolean (false) //IsFloatKey 
+			var config = new Dictionary<NSObject, NSObject>
+			{
+				{ AVAudioSettings.AVSampleRateKey, NSNumber.FromFloat((float)_options.SampleRate) },
+				{ AVAudioSettings.AVFormatIDKey, NSNumber.FromInt32((int)AudioToolbox.AudioFormatType.LinearPCM) },
+				{ AVAudioSettings.AVNumberOfChannelsKey, NSNumber.FromInt32(1) },
+				{ AVAudioSettings.AVLinearPCMBitDepthKey, NSNumber.FromInt32(16) },
+				{ AVAudioSettings.AVLinearPCMIsBigEndianKey, NSNumber.FromBoolean(false) },
+				{ AVAudioSettings.AVLinearPCMIsFloatKey, NSNumber.FromBoolean(false) }
 			};
 
-			//Set up the NSObject Array of keys that will be combined with the values to make the NSDictionary 
-			NSObject[] keys = new NSObject[] { 
-				AVAudioSettings.AVSampleRateKey, 
-				AVAudioSettings.AVFormatIDKey, 
-				AVAudioSettings.AVNumberOfChannelsKey, 
-				AVAudioSettings.AVLinearPCMBitDepthKey, 
-				AVAudioSettings.AVLinearPCMIsBigEndianKey, 
-				AVAudioSettings.AVLinearPCMIsFloatKey 
-			};
+			var settings = NSDictionary.FromObjectsAndKeys(config.Keys.ToArray(), config.Values.ToArray());
 
-			//Set Settings with the Values and Keys to create the NSDictionary 
-			settings = NSDictionary.FromObjectsAndKeys (values, keys);
+			_recorder = AVAudioRecorder.Create(url, new AudioSettings(settings), out err);
+			if (err != null)
+			{
+				return Task.FromResult(new AudioRecordResult($"AVAudioRecorder.Create returned error '{err}'"));
+			}
 
-			//Set recorder parameters 
-			recorder = AVAudioRecorder.Create(url, new AudioSettings(settings), out error);
+			_recorder.PrepareToRecord();
+			_recorder.Record();
 
-			//Set Recorder to Prepare To Record
-			recorder.PrepareToRecord();
-			recorder.Record();
+			Task.Run(() => Timeout());
+
+			return _tcs.Task;
 		}
 
-		public byte[] StopRecording()
+		public void Stop()
 		{
-			recorder.Stop();
+			_cts?.Cancel();
+			_recorder.Stop();
 
-			// read file
-			var f = File.ReadAllBytes(_audioFilePath);
+			byte[] audioBytes = null;
+			if (_options.StreamFormat == AudioRecordOptions.Format.Wave)
+			{
+				audioBytes = File.ReadAllBytes(_audioFilePath);
+			}
+			else if (_options.StreamFormat == AudioRecordOptions.Format.Flac)
+			{
+				// encode audio into flac
+				using (var fr = File.OpenRead(_audioFilePath))
+				{
+					using (var ms = new MemoryStream())
+					{
+						using (var what = new WaveOverFlacStream(ms, WaveOverFlacStreamMode.Encode, true))
+						{
+							fr.CopyTo(what);
+						}
+
+						ms.Flush();
+						ms.Seek(0, SeekOrigin.Begin);
+						audioBytes = ms.ToArray();
+					}
+				}
+			}
 
 			File.Delete(_audioFilePath);
-			return f;
+
+			_tcs.TrySetResult(new AudioRecordResult(audioBytes));
+		}
+
+		private async Task Timeout()
+		{
+			try
+			{
+				await Task.Delay(5000, _cts.Token);
+
+				System.Diagnostics.Debug.WriteLine("TIMEOUT REACHED");
+				Stop();
+				////_tcs.TrySetResult(new AudioRecordResult("Timeout reached"));
+			}
+			catch (TaskCanceledException)
+			{
+				// user stopped recording before timeout reached
+			}
 		}
 	}
 }
